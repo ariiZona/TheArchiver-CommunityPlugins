@@ -4,8 +4,16 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { downloadReddit, hasExistingExternalMedia, maybeDownloadExternalMedia } from "../reddit";
+import {
+  downloadReddit,
+  hasExistingExternalMedia,
+  maybeDownloadExternalMedia,
+  removeImgurUnavailablePlaceholders,
+} from "../reddit";
 import type { DownloadContext, RedditPost } from "../shared";
+
+const IMGUR_UNAVAILABLE_PLACEHOLDER_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAKEAAABRAQMAAACADVTsAAAABlBMVEUiIiL///9ehyAxAAABrElEQVR4Xu3QL2/bQBgG8NdRlrnMNqxu1eVAahCQVAEF03STbsuBSFVZYEBBoJ2RjZ0Hljuy6IZaUlUlpfsKRUmZP4JTNJixkEm7nJu/Mxlot0l7JJOfXj06P/D3xvkBQH/lqoEC7WVvzqM0k/f4+Gat2nt7ppqeCjCbiJX6HmN7vnca4LLc0BljH/yZ0ZejDQXGlA9GmYSthoumVw1wZ6PByxjrpxmeZq0hbMcDXPCHGVB4hHCAkgUKrrNSulawelPRCH37mu4fR1EdZYPwnTA6UZoQfteoMSmPCFVcgYmUmmCuPMKkIAtNFjqS+hWyOo+MzmVsb12NS1aFazThe1Ztr2qYBklWvcPKCKG+TA/MGwjqDcI4n1Pko+1E5KM9TRz75fGB0qWv1Vlq/Bo9Gzqo3oqu7g991G1bVQmp8IQcdeRtEGpyxoVVB5eNLob0qS6xpaJc5+J7Wx+wkwct5SoSn2vCOORKrHZk0lC69tAbm4a2g0grEuknvd9tb61XhqK8hz+d/xG/cft5fD0dvxA7qsLrj+EXWqBugRbeHl6qcbCr4Ba+7Tn88/kJk4CIztd1IrIAAAAASUVORK5CYII=";
 
 test("detects existing Imgur media so Reddit re-archives do not refresh it", async () => {
   const postDir = fs.mkdtempSync(path.join(os.tmpdir(), "plugin-social-reddit-"));
@@ -13,6 +21,23 @@ test("detects existing Imgur media so Reddit re-archives do not refresh it", asy
     fs.writeFileSync(path.join(postDir, "imgur_abc123.jpg"), "original bytes");
 
     assert.equal(await hasExistingExternalMedia(postDir, "imgur"), true);
+  } finally {
+    fs.rmSync(postDir, { recursive: true, force: true });
+  }
+});
+
+test("does not treat an already archived Imgur unavailable placeholder as media", async () => {
+  const postDir = fs.mkdtempSync(path.join(os.tmpdir(), "plugin-social-reddit-"));
+  const placeholderPath = path.join(postDir, "imgur_deleted.jpg");
+
+  try {
+    fs.writeFileSync(
+      placeholderPath,
+      Buffer.from(IMGUR_UNAVAILABLE_PLACEHOLDER_BASE64, "base64")
+    );
+
+    assert.equal(await hasExistingExternalMedia(postDir, "imgur"), false);
+    assert.equal(fs.existsSync(placeholderPath), false);
   } finally {
     fs.rmSync(postDir, { recursive: true, force: true });
   }
@@ -66,6 +91,31 @@ test("skips gallery-dl for an Imgur Reddit post when archived Imgur media alread
       fs.readFileSync(path.join(postDir, "imgur_abc123.jpg"), "utf8"),
       "original bytes"
     );
+  } finally {
+    fs.rmSync(postDir, { recursive: true, force: true });
+  }
+});
+
+test("rejects Imgur's unavailable-image placeholder without removing real media", async () => {
+  const postDir = fs.mkdtempSync(path.join(os.tmpdir(), "plugin-social-reddit-"));
+  const placeholderPath = path.join(postDir, "deleted-image.jpg");
+  const realImagePath = path.join(postDir, "real-image.jpg");
+
+  try {
+    fs.writeFileSync(
+      placeholderPath,
+      Buffer.from(IMGUR_UNAVAILABLE_PLACEHOLDER_BASE64, "base64")
+    );
+    fs.writeFileSync(realImagePath, "real image bytes");
+
+    const removed = await removeImgurUnavailablePlaceholders([
+      placeholderPath,
+      realImagePath,
+    ]);
+
+    assert.equal(removed, 1);
+    assert.equal(fs.existsSync(placeholderPath), false);
+    assert.equal(fs.readFileSync(realImagePath, "utf8"), "real image bytes");
   } finally {
     fs.rmSync(postDir, { recursive: true, force: true });
   }

@@ -2238,12 +2238,47 @@ const EXTERNAL_MEDIA_HOSTS: Record<string, { prefix: string; site: string }> = {
 };
 
 const EXTERNAL_MEDIA_EXT_RE = /\.(jpe?g|png|gif|webp|bmp|avif|mp4|webm|mov|avi|mkv)$/i;
+const IMGUR_UNAVAILABLE_SHA256 =
+  "9b5936f4006146e4e1e9025b474c02863c0b5614132ad40db4b925a10e8bfbb9";
 
 /** Normalize a hostname for allow-list lookup (strips common www./m. prefixes). */
 function normalizeHost(hostname: string): string {
   return hostname
     .toLowerCase()
     .replace(/^(www\.|m\.|old\.|new\.)/, "");
+}
+
+function isImgurMediaUrl(url: string): boolean {
+  try {
+    const host = normalizeHost(new URL(url).hostname);
+    return host === "imgur.com" || host.endsWith(".imgur.com");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Delete Imgur's static "image is no longer available" response when it was
+ * saved under the requested media filename. The exact content hash avoids
+ * rejecting legitimate small images based on dimensions or file size alone.
+ */
+export async function removeImgurUnavailablePlaceholders(
+  filePaths: string[]
+): Promise<number> {
+  let removed = 0;
+  for (const filePath of filePaths) {
+    try {
+      const content = await fs.promises.readFile(filePath);
+      const hash = crypto.createHash("sha256").update(content).digest("hex");
+      if (hash !== IMGUR_UNAVAILABLE_SHA256) continue;
+      await fs.promises.unlink(filePath);
+      removed++;
+    } catch (err) {
+      if (err instanceof Error && "code" in err && err.code === "ENOENT") continue;
+      throw err;
+    }
+  }
+  return removed;
 }
 
 /**
@@ -2324,12 +2359,18 @@ export async function hasExistingExternalMedia(
   }
 
   const filenamePrefix = `${prefix}_`;
-  return entries.some(
+  const mediaPaths = entries.filter(
     (entry) =>
       entry.isFile() &&
       entry.name.startsWith(filenamePrefix) &&
       EXTERNAL_MEDIA_EXT_RE.test(entry.name)
-  );
+  ).map((entry) => path.join(postDir, entry.name));
+
+  if (prefix === "imgur") {
+    await removeImgurUnavailablePlaceholders(mediaPaths);
+  }
+
+  return mediaPaths.some((filePath) => fs.existsSync(filePath));
 }
 
 /**
@@ -2373,9 +2414,21 @@ export async function maybeDownloadExternalMedia(
       io: helpers.io,
     });
 
-    if (result.success && result.downloadedFiles.length > 0) {
+    const rejected = picked.site === "imgur"
+      ? await removeImgurUnavailablePlaceholders(result.downloadedFiles)
+      : 0;
+    const archivedFiles = result.downloadedFiles.filter((filePath) =>
+      fs.existsSync(filePath)
+    );
+    if (rejected > 0) {
+      logger.warn(
+        `Rejected ${rejected} Imgur unavailable-image placeholder(s)`
+      );
+    }
+
+    if (result.success && archivedFiles.length > 0) {
       logger.info(
-        `gallery-dl archived ${result.downloadedFiles.length} file(s) for ${picked.site}: ${result.downloadedFiles
+        `gallery-dl archived ${archivedFiles.length} file(s) for ${picked.site}: ${archivedFiles
           .map((f) => path.basename(f))
           .join(", ")}`
       );
@@ -2492,9 +2545,18 @@ async function downloadPostToFolder(
 
   const downloads: Array<{ url: string; outputPath: string }> = [];
   let skipped = 0;
+  let rejected = 0;
 
   for (const item of mediaItems) {
     const outputPath = path.join(postDir, item.filename);
+    if (isImgurMediaUrl(item.url)) {
+      const removed = await removeImgurUnavailablePlaceholders([outputPath]);
+      if (removed > 0) {
+        logger.warn(
+          `Removed previously archived Imgur unavailable-image placeholder: ${item.filename}`
+        );
+      }
+    }
     if (await helpers.io.fileExists(outputPath)) {
       logger.info(`Already exists, skipping: ${item.filename}`);
       skipped++;
@@ -2509,9 +2571,22 @@ async function downloadPostToFolder(
       context.maxDownloadThreads,
       authenticatedIoOptions(cookieHeader)
     );
+    rejected = await removeImgurUnavailablePlaceholders(
+      downloads.filter((item) => isImgurMediaUrl(item.url)).map((item) => item.outputPath)
+    );
+    if (rejected > 0) {
+      logger.warn(
+        `Rejected ${rejected} Imgur unavailable-image placeholder(s); no media was archived for those items`
+      );
+    }
   }
 
-  return { downloaded: downloads.length, skipped, isVideo: false, metadataSaved: true };
+  return {
+    downloaded: downloads.length - rejected,
+    skipped,
+    isVideo: false,
+    metadataSaved: true,
+  };
 }
 
 async function handleSinglePost(
@@ -2617,9 +2692,18 @@ async function handleSinglePost(
 
   const downloads: Array<{ url: string; outputPath: string }> = [];
   let skipped = 0;
+  let rejected = 0;
 
   for (const item of mediaItems) {
     const outputPath = path.join(postDir, item.filename);
+    if (isImgurMediaUrl(item.url)) {
+      const removed = await removeImgurUnavailablePlaceholders([outputPath]);
+      if (removed > 0) {
+        logger.warn(
+          `Removed previously archived Imgur unavailable-image placeholder: ${item.filename}`
+        );
+      }
+    }
     if (await helpers.io.fileExists(outputPath)) {
       logger.info(`Already exists, skipping: ${item.filename}`);
       skipped++;
@@ -2631,10 +2715,18 @@ async function handleSinglePost(
   if (downloads.length > 0) {
     logger.info(`Downloading ${downloads.length} file(s) to: ${postDir}`);
     await helpers.io.downloadFiles(downloads, context.maxDownloadThreads);
+    rejected = await removeImgurUnavailablePlaceholders(
+      downloads.filter((item) => isImgurMediaUrl(item.url)).map((item) => item.outputPath)
+    );
+    if (rejected > 0) {
+      logger.warn(
+        `Rejected ${rejected} Imgur unavailable-image placeholder(s); no media was archived for those items`
+      );
+    }
   }
 
   const parts: string[] = [];
-  parts.push(`Downloaded ${downloads.length} file(s) from "${post.title}"`);
+  parts.push(`Downloaded ${downloads.length - rejected} file(s) from "${post.title}"`);
   if (skipped > 0) parts.push(`${skipped} already existed`);
   parts.push("metadata saved");
 

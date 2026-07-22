@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+## 1.12.9
+
+- Preserve valid archived Imgur media while rejecting Imgur's static unavailable-image placeholder from both new downloads and existing archives.
+
 ## 1.12.8
 
 - Bump and republish the Socials plugin so TheArchiver clients detect the Reddit profile archive cookie fix as a new update.
